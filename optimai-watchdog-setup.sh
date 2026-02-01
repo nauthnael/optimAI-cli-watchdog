@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # =========================================================
-# OptimAI Watchdog Setup v3 (tmux send-keys based)
-# - tmux session ALWAYS alive
-# - start node via send-keys (no auto-exit)
-# - child-process check
-# - Telegram alert
-# - restart rate-limit
+# OptimAI Watchdog Setup v4 (screen based)
+# - Start node in screen session "o"
+# - Log node to /var/log/optimai-node.log
+# - Telegram alert on restart
+# - Rate limit restarts
+# - systemd timer runs every minute
 # =========================================================
 
-### -------- DEFAULT CONFIG --------
-TMUX_SESSION="o"
+# Defaults
+SESSION_NAME="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
 CLI_BIN="optimai-cli"
 
@@ -19,7 +19,7 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 
 MAX_RESTARTS=3
-WINDOW_SECONDS=600   # 10 minutes
+WINDOW_SECONDS=600
 
 WATCHDOG_PATH="/usr/local/bin/optimai-watchdog.sh"
 SERVICE_PATH="/etc/systemd/system/optimai-watchdog.service"
@@ -29,7 +29,6 @@ STATE_DIR="/var/lib/optimai-watchdog"
 WATCHDOG_LOG="/var/log/optimai-watchdog.log"
 NODE_LOG="/var/log/optimai-node.log"
 
-### -------- HELP --------
 usage() {
 cat <<'EOF'
 Usage:
@@ -40,7 +39,7 @@ Required:
   --chat-id      Telegram chat id
 
 Optional:
-  --session      tmux session name (default: o)
+  --session      screen session name (default: o)
   --cli          optimai-cli path (default: /usr/local/bin/optimai-cli)
   --max          max restarts per window (default: 3)
   --window       window seconds (default: 600)
@@ -50,9 +49,8 @@ Example:
 EOF
 }
 
-### -------- PRECHECK --------
 must_be_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "[!] Run as root"; exit 1; }
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "[!] Run as root (sudo)."; exit 1; }
 }
 
 parse_args() {
@@ -60,7 +58,7 @@ parse_args() {
     case "$1" in
       --token) TG_BOT_TOKEN="${2:-}"; shift 2 ;;
       --chat-id) TG_CHAT_ID="${2:-}"; shift 2 ;;
-      --session) TMUX_SESSION="${2:-}"; shift 2 ;;
+      --session) SESSION_NAME="${2:-}"; shift 2 ;;
       --cli) CLI_PATH="${2:-}"; shift 2 ;;
       --max) MAX_RESTARTS="${2:-}"; shift 2 ;;
       --window) WINDOW_SECONDS="${2:-}"; shift 2 ;;
@@ -69,30 +67,26 @@ parse_args() {
     esac
   done
 
-  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]] || {
-    echo "[!] Missing --token or --chat-id"; exit 1;
-  }
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]] || { echo "[!] Missing --token or --chat-id"; usage; exit 1; }
 }
 
 ensure_deps() {
   command -v systemctl >/dev/null || { echo "[!] systemd required"; exit 1; }
-  command -v tmux >/dev/null || { echo "[!] tmux required"; exit 1; }
   command -v curl >/dev/null || { echo "[!] curl required"; exit 1; }
+  command -v screen >/dev/null || { echo "[!] screen required. Install: apt-get install -y screen"; exit 1; }
   [[ -x "$CLI_PATH" ]] || { echo "[!] optimai-cli not found at $CLI_PATH"; exit 1; }
 }
 
-### -------- WRITE WATCHDOG --------
 write_watchdog() {
-echo "[*] Writing watchdog v3..."
+  echo "[*] Writing watchdog v4 (screen)..."
+  mkdir -p "$STATE_DIR"
+  touch "$WATCHDOG_LOG" "$NODE_LOG"
 
-mkdir -p "$STATE_DIR"
-touch "$WATCHDOG_LOG" "$NODE_LOG"
-
-cat > "$WATCHDOG_PATH" <<EOF
+  cat > "$WATCHDOG_PATH" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMUX_SESSION="${TMUX_SESSION}"
+SESSION_NAME="${SESSION_NAME}"
 CLI_PATH="${CLI_PATH}"
 CLI_BIN="${CLI_BIN}"
 
@@ -119,11 +113,11 @@ send_tg(){
 
 log(){ echo "[\$(ts)] \$1" >> "\$WATCHDOG_LOG"; }
 
-command -v tmux >/dev/null || exit 0
+command -v screen >/dev/null 2>&1 || exit 0
 [[ -x "\$CLI_PATH" ]] || exit 0
 
 mkdir -p "\$STATE_DIR"
-touch "\$STATE_FILE"
+touch "\$STATE_FILE" "\$WATCHDOG_LOG" "\$NODE_LOG"
 
 cleanup(){
   local cutoff=\$((\$(now)-WINDOW_SECONDS))
@@ -133,19 +127,27 @@ cleanup(){
 
 can_restart(){
   cleanup
-  [[ \$(wc -l < "\$STATE_FILE") -lt "\$MAX_RESTARTS" ]]
+  [[ \$(wc -l < "\$STATE_FILE" 2>/dev/null || echo 0) -lt "\$MAX_RESTARTS" ]]
 }
 
 record_restart(){ echo "\$(now)" >> "\$STATE_FILE"; }
 
-start_tmux(){
-  log "Starting node via tmux send-keys"
-  tmux kill-session -t "\$TMUX_SESSION" 2>/dev/null || true
-  sleep 1
-  tmux new-session -d -s "\$TMUX_SESSION"
-  sleep 1
-  tmux send-keys -t "\$TMUX_SESSION" \
-    "exec \$CLI_PATH node start 2>&1 | tee -a \$NODE_LOG" C-m
+screen_exists(){
+  screen -ls | grep -q "[.]\\\${SESSION_NAME}[[:space:]]"
+}
+
+start_screen(){
+  log "Starting node in screen '\$SESSION_NAME'..."
+  # kill old session if exists
+  if screen_exists; then
+    screen -S "\$SESSION_NAME" -X quit || true
+    sleep 1
+  fi
+
+  # start detached screen session with bash -lc + log
+  # NOTE: if node exits, session ends (expected). log will contain the reason.
+  screen -dmS "\$SESSION_NAME" bash -lc "\$CLI_PATH node start 2>&1 | tee -a '\$NODE_LOG'"
+  sleep 2
 }
 
 restart_node(){
@@ -155,49 +157,48 @@ restart_node(){
 
 Server: \$(hostname)
 Reason: restart limit exceeded
-Action: manual check required"
+Action: manual check required
+
+Tip: tail -n 50 \$NODE_LOG"
     exit 0
   fi
 
   record_restart
-  start_tmux
+  start_screen
 
-  send_tg "🔄 OptimAI Node Restarted
+  send_tg "🔄 OptimAI Node Restarted (screen)
 
 Server: \$(hostname)
 Time: \$(ts)
-Session: \$TMUX_SESSION"
+Session: \$SESSION_NAME"
 }
 
-# -------- CHECK TMUX --------
-if ! tmux has-session -t "\$TMUX_SESSION" 2>/dev/null; then
-  log "tmux session missing"
+# -------- CHECK 1: screen session exists? --------
+if ! screen_exists; then
+  log "screen session '\$SESSION_NAME' not found"
   restart_node
   exit 0
 fi
 
-# -------- CHECK PROCESS --------
-FOUND=0
-for p in \$(tmux list-panes -t "\$TMUX_SESSION" -F '#{pane_pid}'); do
-  if pgrep -P "\$p" -fa "\$CLI_BIN.*node start" >/dev/null; then
-    FOUND=1; break
-  fi
-done
+# -------- CHECK 2: optimai process exists? --------
+# If screen exists but process died, we restart.
+if ! pgrep -fa "\$CLI_BIN.*node start" >/dev/null 2>&1; then
+  log "screen alive but node process missing"
+  restart_node
+  exit 0
+fi
 
-[[ "\$FOUND" -eq 1 ]] && exit 0
-
-log "tmux alive but node process missing"
-restart_node
+exit 0
 EOF
 
-chmod +x "$WATCHDOG_PATH"
+  chmod +x "$WATCHDOG_PATH"
 }
 
-### -------- SYSTEMD --------
 write_systemd() {
-cat > "$SERVICE_PATH" <<EOF
+  echo "[*] Writing systemd service + timer..."
+  cat > "$SERVICE_PATH" <<EOF
 [Unit]
-Description=OptimAI Watchdog v3
+Description=OptimAI Watchdog v4 (screen)
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -206,7 +207,7 @@ Type=oneshot
 ExecStart=${WATCHDOG_PATH}
 EOF
 
-cat > "$TIMER_PATH" <<'EOF'
+  cat > "$TIMER_PATH" <<'EOF'
 [Unit]
 Description=Run OptimAI Watchdog every minute
 
@@ -225,8 +226,7 @@ enable_timer() {
   systemctl enable --now optimai-watchdog.timer
 }
 
-### -------- MAIN --------
-main(){
+main() {
   must_be_root
   parse_args "$@"
   ensure_deps
@@ -234,13 +234,18 @@ main(){
   write_systemd
   enable_timer
 
-  echo "✅ OptimAI Watchdog v3 installed"
+  echo "✅ OptimAI Watchdog v4 (screen) installed"
+  echo
+  echo "Check:"
+  echo "  systemctl status optimai-watchdog.timer --no-pager"
   echo "Logs:"
-  echo "  Watchdog: $WATCHDOG_LOG"
-  echo "  Node:     $NODE_LOG"
-  echo "tmux:"
-  echo "  tmux ls"
-  echo "  tmux attach -t $TMUX_SESSION"
+  echo "  tail -n 100 $WATCHDOG_LOG"
+  echo "  tail -n 100 $NODE_LOG"
+  echo
+  echo "Screen:"
+  echo "  screen -ls"
+  echo "  screen -r $SESSION_NAME"
+  echo "Detach screen: Ctrl+a then d"
 }
 
 main "$@"
